@@ -705,6 +705,7 @@ def train_agent():
             # Make the move
             game.make_move(*move)
 
+        winner = game.get_winner()
         for state, pi, player in training_examples:
             if winner == player:
                 reward = 1
