@@ -1,17 +1,18 @@
+from collections import deque, defaultdict
+from copy import deepcopy
+import glob
+import logging
+import math
+import matplotlib.patches as patches
+import matplotlib.pyplot as plt
 import numpy as np
+import os
+import random
+import time
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
-import random
-from collections import deque, defaultdict
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-import math
-import os
-import glob
-import time
-import logging
+import torch.optim as optim
 import warnings
 
 # =========================
@@ -166,7 +167,7 @@ class HexGame:
         board = np.full((size, size), -1, dtype=int)
         for i in range(size):
             for j in range(size):
-                if self.is_valid_position(i, j):
+                if self.is_valid_position_static(i, j, self.board_size):
                     board[i, j] = EMPTY
         return board
 
@@ -181,7 +182,7 @@ class HexGame:
         edge_cells = []
         for i in range(size):
             for j in range(size):
-                if self.is_valid_position(i, j):
+                if self.is_valid_position_static(i, j, self.board_size):
                     if self.is_edge_cell(i, j):
                         edge_cells.append((i, j))
         # Ensure center cell is not in edge cells
