@@ -83,7 +83,7 @@ class HexGame:
             return PLAYER2
         else:
             return 0  # Draw
-        
+
     def fill_empty_cells(self):
         size = self.board.shape[0]
         for x in range(size):
@@ -130,7 +130,6 @@ class HexGame:
                 opponent = min_player if player == max_player else max_player
                 for (x, y), group_id in groups[player].items():
                     if num_edge_nodes[player][group_id] < 2:
-                        print(f"Flipping {player} group at {x}, {y}")
                         self.board[x, y] = opponent
                         done = False  # We made a change, need another iteration
 
@@ -297,7 +296,7 @@ class HexGame:
                     ax.add_patch(hex_patch)
 
                     # Print coordinates for all cells
-                    ax.text(x_offset, y_offset, f"({i},{j})", 
+                    ax.text(x_offset, y_offset, f"({i},{j})",
                             ha='center', va='center', fontsize=6, fontweight='bold')
 
         # Calculate scores
@@ -348,23 +347,9 @@ class HexGame:
 
 if __name__ == "__main__":
     game = HexGame(board_size=3)
-    game.make_move(2, 2)
-    game.make_move(3, 2)
-    game.play_random_move()
-    game.make_move(2, 3)
-    game.play_random_move()
-    game.make_move(1, 3)
-    game.play_random_move()
-    game.make_move(1, 2)
-    game.play_random_move()
-    game.make_move(2, 1)
-    game.play_random_move()
-    game.make_move(3, 1)
-    game.play_random_move()
-    game.make_move(0, 2)
-    game.play_random_move()
-
+    game.play_random_game()
     game.render(save_path="test.png", show=True)
     scores = game.calculate_scores()
-    print("scores", scores) 
+    print("scores", scores)
+    print("winner", game.get_winner())
     game.render(save_path="test2.png", show=True)
