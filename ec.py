@@ -38,14 +38,14 @@ warnings.simplefilter('ignore', category=UserWarning)
 warnings.simplefilter('ignore', category=FutureWarning)
 
 # Game Constants
-BOARD_SIZE = 3 # Radius of the hexagonal board
+BOARD_SIZE = 8 # Radius of the hexagonal board
 
 # Training Parameters
 LEARNING_RATE = 1e-2
-BATCH_SIZE = 256  # Increased batch size
-MEMORY_SIZE = 1000
-NUM_EPISODES = 1000
-MCTS_SIMULATIONS = 50  # You can increase this number to make MCTS more intensive
+BATCH_SIZE = 16384  # Increased batch size
+MEMORY_SIZE = 100000
+NUM_EPISODES = 10000
+MCTS_SIMULATIONS = 800  # You can increase this number to make MCTS more intensive
 CPUCT = 1.0  # Exploration constant
 NUM_RES_BLOCKS = 10  # Increased number of residual blocks
 NUM_FILTERS = 128  # Increased number of filters
@@ -56,10 +56,10 @@ T_MAX = NUM_EPISODES
 
 # Adjust the number of self-play processes
 NUM_CPUS = os.cpu_count()
-NUM_SELF_PLAYERS = min(NUM_CPUS, 8)  # Adjust based on CPU availability
+NUM_SELF_PLAYERS = min(NUM_CPUS, 32)  # Adjust based on CPU availability
 
 # Adjust saving frequency
-SAVE_INTERVAL = 10  # Save model every 10 episodes
+SAVE_INTERVAL = 50  # Save model every 10 episodes
 
 # =========================
 # Helper Functions
@@ -223,7 +223,7 @@ class MCTS:
         self.num_simulations = num_simulations
         self.cpuct = cpuct
         self.device = device
-    
+
     def evaluate(self, game_states):
         """
         Evaluate a batch of game states using the neural network.
@@ -430,31 +430,31 @@ def play_game(neural_net_state_dict, device, return_data_queue):
 
     while not game.is_game_over():
         action_probs = mcts.get_action_probs(game, temp=1)
-        
+
         # Check that action_probs are valid
         total_prob = sum(action_probs.values())
         assert total_prob > 0, "Total probability from action_probs is zero or negative."
         action_probs = {k: v / total_prob for k, v in action_probs.items()}
         assert all(v >= 0 for v in action_probs.values()), f"Negative probabilities in action_probs: {action_probs}"
         assert abs(sum(action_probs.values()) - 1.0) < 1e-6, f"Probabilities in action_probs do not sum to 1, sum: {sum(action_probs.values())}"
-        
+
         # Proceed with choosing the move
         moves = list(action_probs.keys())
         probs = list(action_probs.values())
         move = random.choices(moves, weights=probs)[0]
-        
+
         state_tensor = state_to_tensor(game.get_state(), game.current_player)
         pi = np.zeros(neural_net.num_actions, dtype=np.float32)
         for move_prob, prob in action_probs.items():
             index = move_to_index(move_prob, game.board_size)
             pi[index] = prob
-        
+
         # Add assertions to check pi
         assert np.all(pi >= 0), f"Negative probabilities in pi: {pi[pi < 0]}"
         assert np.isclose(np.sum(pi), 1.0), f"Probabilities in pi do not sum to 1, sum: {np.sum(pi)}"
-        
+
         training_examples.append((state_tensor, pi, game.current_player))
-        
+
         # Make the move
         game.make_move(*move)
 
