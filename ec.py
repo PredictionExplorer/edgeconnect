@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import warnings
 from hex_game import HexGame
+from hex_game import PLAYER1, PLAYER2
 
 # =========================
 # Configuration and Constants
@@ -37,18 +38,14 @@ warnings.simplefilter('ignore', category=UserWarning)
 warnings.simplefilter('ignore', category=FutureWarning)
 
 # Game Constants
-BOARD_SIZE = 5 # Radius of the hexagonal board
-NUM_PLAYERS = 2
-EMPTY = 0
-PLAYER1 = 1
-PLAYER2 = 2
+BOARD_SIZE = 3 # Radius of the hexagonal board
 
 # Training Parameters
 LEARNING_RATE = 1e-2
-BATCH_SIZE = 16384  # Increased batch size
-MEMORY_SIZE = 100000
+BATCH_SIZE = 256  # Increased batch size
+MEMORY_SIZE = 1000
 NUM_EPISODES = 1000
-MCTS_SIMULATIONS = 10  # You can increase this number to make MCTS more intensive
+MCTS_SIMULATIONS = 50  # You can increase this number to make MCTS more intensive
 CPUCT = 1.0  # Exploration constant
 NUM_RES_BLOCKS = 10  # Increased number of residual blocks
 NUM_FILTERS = 128  # Increased number of filters
@@ -59,7 +56,7 @@ T_MAX = NUM_EPISODES
 
 # Adjust the number of self-play processes
 NUM_CPUS = os.cpu_count()
-NUM_SELF_PLAYERS = min(NUM_CPUS, 1)  # Adjust based on CPU availability
+NUM_SELF_PLAYERS = min(NUM_CPUS, 8)  # Adjust based on CPU availability
 
 # Adjust saving frequency
 SAVE_INTERVAL = 10  # Save model every 10 episodes
@@ -101,49 +98,7 @@ def state_to_tensor(state, current_player):
     state_tensor = np.zeros((2, state.shape[0], state.shape[1]), dtype=np.float32)
     state_tensor[0] = (state == current_player).astype(np.float32)
     state_tensor[1] = (state == (3 - current_player)).astype(np.float32)
-    return torch.from_numpy(state_tensor).unsqueeze(0)  # Shape: [1, 2, size, size]
-
-def augment_data(state, pi, board_size=BOARD_SIZE):
-    """
-    Apply rotational and reflectional transformations to the state and policy.
-    """
-    augmented_data = []
-    state_np = state.squeeze(0).numpy()
-    size = 2 * board_size - 1
-
-    # Create a full board representation of pi
-    pi_full = np.full((size, size), -1, dtype=np.float32)
-    index = 0
-    for i in range(size):
-        for j in range(size):
-            if HexGame.is_valid_position_static(i, j, board_size):
-                pi_full[i, j] = pi[index]
-                index += 1
-
-    for k in range(6):
-        # Rotate state and pi
-        rotated_state = np.rot90(state_np, k, axes=(1, 2))
-        rotated_pi_full = np.rot90(pi_full, k)
-        # Flatten pi back to valid positions
-        pi_aug = []
-        for i in range(size):
-            for j in range(size):
-                if HexGame.is_valid_position_static(i, j, board_size):
-                    pi_aug.append(rotated_pi_full[i, j])
-        augmented_data.append((torch.from_numpy(rotated_state.copy()), np.array(pi_aug)))
-
-        # Flip state horizontally
-        flipped_state = np.flip(rotated_state, axis=2)
-        flipped_pi_full = np.flip(rotated_pi_full, axis=1)
-        # Flatten pi back to valid positions
-        pi_aug = []
-        for i in range(size):
-            for j in range(size):
-                if HexGame.is_valid_position_static(i, j, board_size):
-                    pi_aug.append(flipped_pi_full[i, j])
-        augmented_data.append((torch.from_numpy(flipped_state.copy()), np.array(pi_aug)))
-
-    return augmented_data
+    return torch.from_numpy(state_tensor)  # Shape: [2, size, size]
 
 # =========================
 # Neural Network Classes
@@ -197,6 +152,8 @@ class ResidualBlock(nn.Module):
         self.bn2 = nn.BatchNorm2d(num_filters)
 
     def forward(self, x):
+        #print(f"Input tensor shape in forward: {x.shape}")  # Debugging
+        assert x.dim() == 4, f"Input tensor should be 4D, got {x.shape}"
         residual = x
         out = F.silu(self.bn1(self.conv1(x)))  # Using SiLU activation function
         out = self.dropout(out)
@@ -266,7 +223,7 @@ class MCTS:
         self.num_simulations = num_simulations
         self.cpuct = cpuct
         self.device = device
-
+    
     def evaluate(self, game_states):
         """
         Evaluate a batch of game states using the neural network.
@@ -278,7 +235,9 @@ class MCTS:
         for game in game_states:
             state_tensor = state_to_tensor(game.get_state(), game.current_player)
             state_tensors.append(state_tensor)
-        state_tensors = torch.cat(state_tensors).to(self.device)
+        state_tensors = torch.stack(state_tensors).to(self.device)
+        #print(f"state_tensors shape in evaluate: {state_tensors.shape}")  # Debugging
+        assert state_tensors.dim() == 4, f"state_tensors should be 4D, got {state_tensors.shape}"
         with torch.no_grad():
             policies, values = self.neural_net(state_tensors)
             policies = policies.exp().cpu().numpy()
@@ -344,7 +303,7 @@ class MCTS:
         for move, child in root.children.items():
             visit_counts[move] = child.visit_count
 
-        # Apply temperature
+        # After computing probs
         if temp == 0:
             best_move = max(visit_counts.items(), key=lambda x: x[1])[0]
             probs = {best_move: 1.0}
@@ -359,6 +318,12 @@ class MCTS:
                 # Assign equal probability if visits_sum is zero
                 num_moves = len(moves)
                 probs = {move: 1 / num_moves for move in moves}
+
+        # Add assertions to check probs
+        assert all(v >= 0 for v in probs.values()), f"Negative probabilities in probs: {probs}"
+        total_prob = sum(probs.values())
+        assert abs(total_prob - 1.0) < 1e-6, f"Probabilities in probs do not sum to 1, sum: {total_prob}"
+
 
         return probs
 
@@ -418,7 +383,7 @@ def evaluate_model(neural_net, num_games=10, device='cpu'):
     neural_net.eval()
     wins = 0
     for _ in range(num_games):
-        game = HexGame()
+        game = HexGame(board_size=BOARD_SIZE)
         mcts = MCTS(neural_net, num_simulations=MCTS_SIMULATIONS, cpuct=CPUCT, device=device)
         while not game.is_game_over():
             if game.current_player == PLAYER1:
@@ -439,7 +404,6 @@ def evaluate_model(neural_net, num_games=10, device='cpu'):
     return win_rate
 
 def play_game(neural_net_state_dict, device, return_data_queue):
-    print("playing game")
     """
     Play a single self-play game and return training data.
     """
@@ -460,33 +424,43 @@ def play_game(neural_net_state_dict, device, return_data_queue):
     neural_net.to(device)
     neural_net.eval()
 
-    game = HexGame()
+    game = HexGame(board_size=BOARD_SIZE)
     mcts = MCTS(neural_net, num_simulations=MCTS_SIMULATIONS, cpuct=CPUCT, device=device)
     training_examples = []
 
     while not game.is_game_over():
         action_probs = mcts.get_action_probs(game, temp=1)
-
-        # Choose action according to probabilities
+        
+        # Check that action_probs are valid
+        total_prob = sum(action_probs.values())
+        assert total_prob > 0, "Total probability from action_probs is zero or negative."
+        action_probs = {k: v / total_prob for k, v in action_probs.items()}
+        assert all(v >= 0 for v in action_probs.values()), f"Negative probabilities in action_probs: {action_probs}"
+        assert abs(sum(action_probs.values()) - 1.0) < 1e-6, f"Probabilities in action_probs do not sum to 1, sum: {sum(action_probs.values())}"
+        
+        # Proceed with choosing the move
         moves = list(action_probs.keys())
         probs = list(action_probs.values())
-        if any(np.isnan(probs)) or sum(probs) == 0:
-            # Assign equal probability if probs are invalid
-            probs = [1 / len(probs)] * len(probs)
         move = random.choices(moves, weights=probs)[0]
-
-        # Record training data
+        
         state_tensor = state_to_tensor(game.get_state(), game.current_player)
         pi = np.zeros(neural_net.num_actions, dtype=np.float32)
         for move_prob, prob in action_probs.items():
             index = move_to_index(move_prob, game.board_size)
             pi[index] = prob
+        
+        # Add assertions to check pi
+        assert np.all(pi >= 0), f"Negative probabilities in pi: {pi[pi < 0]}"
+        assert np.isclose(np.sum(pi), 1.0), f"Probabilities in pi do not sum to 1, sum: {np.sum(pi)}"
+        
         training_examples.append((state_tensor, pi, game.current_player))
-
+        
         # Make the move
         game.make_move(*move)
 
     winner = game.get_winner()
+
+    # After the game ends
     data = []
     for state, pi, player in training_examples:
         if winner == player:
@@ -495,15 +469,7 @@ def play_game(neural_net_state_dict, device, return_data_queue):
             reward = 0
         else:
             reward = -1
-
-        augmented_data = augment_data(state, pi, game.board_size)
-        for aug_state, aug_pi in augmented_data:
-            data.append((aug_state.unsqueeze(0), aug_pi, reward))
-
-    # Save the final game board
-    game_id = random.randint(0, int(1e6))
-    print("saving png")
-    game.render(save_path=f"game_{game_id}.png")
+        data.append((state, pi, reward))
 
     return_data_queue.put(data)
 
@@ -626,7 +592,7 @@ def train():
         if len(memory) >= BATCH_SIZE:
             # Sample a batch
             batch = random.sample(memory, BATCH_SIZE)
-            states = torch.cat([item[0] for item in batch]).to(device)
+            states = torch.stack([item[0] for item in batch]).to(device)
 
             # Prepare target policy and value
             target_pis = torch.zeros((BATCH_SIZE, neural_net.num_actions), dtype=torch.float32).to(device)
@@ -636,14 +602,43 @@ def train():
                 target_pis[idx] = torch.from_numpy(pi).to(device)
                 target_vs[idx] = reward
 
+            # Add assertions to check target_pis
+            assert torch.all(target_pis >= 0), f"Negative probabilities found in target_pis: {target_pis[target_pis < 0]}"
+            assert torch.all(target_pis <= 1), f"Probabilities in target_pis exceed 1: {target_pis[target_pis > 1]}"
+            row_sums = target_pis.sum(dim=1)
+            assert torch.allclose(row_sums, torch.ones(BATCH_SIZE).to(device), atol=1e-6), f"Probabilities in target_pis do not sum to 1, sums: {row_sums}"
+
+            # Optional: Print min, max, and sum of target_pis for debugging
+            #print(f"target_pis min: {target_pis.min().item()}, max: {target_pis.max().item()}, sum per sample (should be 1): {row_sums}")
+
+
             # Forward pass
             ddp_model.train()
             out_pis, out_vs = ddp_model(states)
 
+            # Since out_pis are log probabilities, exponentiate to get probabilities
+            out_pis_exp = out_pis.exp()
+
+            # Add assertions to check out_pis_exp
+            assert torch.all(out_pis_exp >= 0), f"Negative probabilities found in out_pis_exp: {out_pis_exp[out_pis_exp < 0]}"
+            row_sums_out = out_pis_exp.sum(dim=1)
+            assert torch.allclose(row_sums_out, torch.ones(BATCH_SIZE).to(device), atol=1e-6), f"Probabilities in out_pis_exp do not sum to 1, sums: {row_sums_out}"
+
+            # Optional: Print min, max, and sum of out_pis_exp for debugging
+            #print(f"out_pis_exp min: {out_pis_exp.min().item()}, max: {out_pis_exp.max().item()}, sum per sample (should be 1): {row_sums_out}")
+
             # Compute loss
-            loss_pis = -torch.mean(torch.sum(target_pis * out_pis, dim=1))
+            loss_pis = torch.mean(-torch.sum(target_pis * out_pis, dim=1))
             loss_vs = F.mse_loss(out_vs.view(-1), target_vs)
             loss = loss_pis + loss_vs
+
+            # Add assertion to ensure losses are positive
+            assert loss_pis.item() >= 0, f"Policy loss is negative: {loss_pis.item()}"
+            assert loss_vs.item() >= 0, f"Value loss is negative: {loss_vs.item()}"
+            assert loss.item() >= 0, f"Total loss is negative: {loss.item()}"
+
+            # Optional: Print loss values for debugging
+            #print(f"loss_pis: {loss_pis.item()}, loss_vs: {loss_vs.item()}, total_loss: {loss.item()}")
 
             # Backward pass and optimization
             optimizer.zero_grad()
@@ -657,6 +652,8 @@ def train():
             total_value_loss += loss_vs.item()
             total_loss += loss.item()
             episodes_since_last_log += 1
+        else:
+            logging.info(f"Episode {episode}: Not enough data to train. Memory size: {len(memory)}")
 
         # Periodic logging
         if episode % SAVE_INTERVAL == 0 and rank == 0:
