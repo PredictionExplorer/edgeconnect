@@ -16,8 +16,6 @@ import torch.nn.functional as F
 import torch.optim as optim
 import warnings
 import torch.multiprocessing as mp
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 # =========================
 # Configuration and Constants
@@ -625,8 +623,9 @@ def play_game(neural_net_state_dict, device, return_data_queue):
     """
     Play a single self-play game and return training data.
     """
-    neural_net = HexNet(BOARD_SIZE, num_res_blocks=NUM_RES_BLOCKS, num_filters=NUM_FILTERS).to(device)
+    neural_net = HexNet(BOARD_SIZE, num_res_blocks=NUM_RES_BLOCKS, num_filters=NUM_FILTERS)
     neural_net.load_state_dict(neural_net_state_dict)
+    neural_net.to(device)
     neural_net.eval()
 
     game = HexGame()
@@ -728,8 +727,11 @@ def train_agent():
         return_data_queue = manager.Queue()
         processes = []
 
+        # Move the model state_dict to CPU before passing
+        state_dict_cpu = {k: v.cpu() for k, v in neural_net.state_dict().items()}
+
         for _ in range(NUM_SELF_PLAYERS):
-            p = mp.Process(target=play_game, args=(neural_net.state_dict(), device, return_data_queue))
+            p = mp.Process(target=play_game, args=(state_dict_cpu, device.type, return_data_queue))
             p.start()
             processes.append(p)
 
@@ -841,10 +843,4 @@ if __name__ == "__main__":
 
     # Adjust NUM_SELF_PLAYERS
     NUM_CPUS = os.cpu_count()
-    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-        # Use DDP
-        world_size = torch.cuda.device_count()
-        mp.spawn(train_agent, nprocs=world_size)
-    else:
-        # Single-process training
-        train_agent()
+    train_agent()
