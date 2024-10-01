@@ -57,7 +57,7 @@ T_MAX = NUM_EPISODES
 
 # Adjust the number of self-play processes
 NUM_CPUS = os.cpu_count()
-NUM_SELF_PLAYERS = min(NUM_CPUS, 32)  # Adjust based on CPU availability
+NUM_SELF_PLAYERS = min(NUM_CPUS, 4)  # Adjust based on CPU availability
 
 # =========================
 # Helper Functions
@@ -677,19 +677,47 @@ def play_game(neural_net_state_dict, device, return_data_queue):
             data.append((aug_state.unsqueeze(0), aug_pi, reward))
     return_data_queue.put(data)
 
-def train(rank, world_size):
-    # Initialize process group
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+def train():
+    # Check if we're in distributed mode
+    if 'RANK' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
 
-    # Set device for this process
-    torch.cuda.set_device(rank)
-    device = torch.device(f'cuda:{rank}')
+        # Initialize process group with appropriate backend
+        if torch.cuda.is_available():
+            dist_backend = "nccl"
+        else:
+            dist_backend = "gloo"
+        dist.init_process_group(backend=dist_backend, rank=rank, world_size=world_size)
+
+        # Set device for this process
+        if torch.cuda.is_available():
+            torch.cuda.set_device(rank)
+            device = torch.device(f'cuda:{rank}')
+        else:
+            device = torch.device('cpu')  # For CPUs or MPS devices
+    else:
+        # Single-process mode
+        rank = 0
+        world_size = 1
+        if torch.backends.mps.is_available():
+            device = torch.device('mps')
+            print("Using MPS device")
+        elif torch.cuda.is_available():
+            device = torch.device('cuda')
+            print("Using CUDA device")
+        else:
+            device = torch.device('cpu')
+            print("Using CPU device")
 
     # Initialize neural network
     neural_net = HexNet(BOARD_SIZE, num_res_blocks=NUM_RES_BLOCKS, num_filters=NUM_FILTERS).to(device)
 
-    # Wrap model with DDP
-    ddp_model = DDP(neural_net, device_ids=[rank], output_device=rank)
+    if world_size > 1:
+        # Wrap model with DDP
+        ddp_model = DDP(neural_net, device_ids=[device] if device.type == 'cuda' else None, output_device=device)
+    else:
+        ddp_model = neural_net
 
     # Optimizer and Scheduler
     optimizer = optim.SGD(ddp_model.parameters(), lr=LEARNING_RATE, momentum=MOMENTUM, nesterov=True)
@@ -834,19 +862,27 @@ def train(rank, world_size):
         }, "hex_net_final.pth")
         logging.info("Training completed. Final model saved.")
 
-    dist.destroy_process_group()
+    if world_size > 1:
+        dist.destroy_process_group()
 
 # =========================
 # Main Execution
 # =========================
 
 if __name__ == "__main__":
-    # Parse local_rank from environment variable
-    import argparse
+    # Detect device and set up
+    if torch.backends.mps.is_available():
+        print("Using MPS device")
+    elif torch.cuda.is_available():
+        NUM_GPUS = torch.cuda.device_count()
+        print(f"Using CUDA device with {NUM_GPUS} GPUs")
+    else:
+        print("Using CPU device")
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--local_rank', type=int, default=0)
-    args = parser.parse_args()
-
-    world_size = torch.cuda.device_count()
-    train(args.local_rank, world_size)
+    # Check if we're being launched with torchrun (distributed mode)
+    if 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) > 1:
+        # Distributed mode
+        train()
+    else:
+        # Single-process mode
+        train()
