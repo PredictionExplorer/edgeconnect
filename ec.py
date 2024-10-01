@@ -16,6 +16,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 import warnings
 import torch.multiprocessing as mp
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 # =========================
 # Configuration and Constants
@@ -41,20 +43,21 @@ PLAYER2 = 2
 
 # Training Parameters
 LEARNING_RATE = 1e-2
-BATCH_SIZE = 2048  # Increased batch size
-MEMORY_SIZE = 100000  # Increased for more training data
+BATCH_SIZE = 2048  # Adjust based on memory
+MEMORY_SIZE = 100000
 NUM_EPISODES = 1000
-MCTS_SIMULATIONS = 800  # Similar to AlphaZero's approach
+MCTS_SIMULATIONS = 800
 CPUCT = 1.0  # Exploration constant
-NUM_RES_BLOCKS = 5  # Reduced depth for optimization
-NUM_FILTERS = 64  # Reduced width for optimization
+NUM_RES_BLOCKS = 5
+NUM_FILTERS = 64
 MOMENTUM = 0.9
 
 # Learning Rate Scheduler Parameters
 T_MAX = NUM_EPISODES
 
-# Automatically adjust the number of self-play processes
+# Adjust the number of self-play processes
 NUM_CPUS = os.cpu_count()
+NUM_SELF_PLAYERS = min(NUM_CPUS, 32)  # Adjust based on CPU availability
 
 # =========================
 # Helper Functions
@@ -597,6 +600,7 @@ def evaluate_model(neural_net, num_games=10, device='cpu'):
     """
     Evaluate the current model by playing games against a random opponent.
     """
+    neural_net.eval()
     wins = 0
     for _ in range(num_games):
         game = HexGame()
@@ -623,6 +627,10 @@ def play_game(neural_net_state_dict, device, return_data_queue):
     """
     Play a single self-play game and return training data.
     """
+    # Ensure device is set correctly
+    device = torch.device(device)
+
+    # Initialize neural network and load state dict
     neural_net = HexNet(BOARD_SIZE, num_res_blocks=NUM_RES_BLOCKS, num_filters=NUM_FILTERS)
     neural_net.load_state_dict(neural_net_state_dict)
     neural_net.to(device)
@@ -669,27 +677,22 @@ def play_game(neural_net_state_dict, device, return_data_queue):
             data.append((aug_state.unsqueeze(0), aug_pi, reward))
     return_data_queue.put(data)
 
-def train_agent():
-    # Set device
-    if torch.backends.mps.is_available():
-        device = torch.device('mps')
-        print("Using MPS device")
-    elif torch.cuda.is_available():
-        device = torch.device('cuda')
-        NUM_GPUS = torch.cuda.device_count()
-        print(f"Using CUDA device with {NUM_GPUS} GPUs")
-    else:
-        device = torch.device('cpu')
-        print("Using CPU device")
+def train(rank, world_size):
+    # Initialize process group
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
-    # Adjust NUM_SELF_PLAYERS
-    NUM_SELF_PLAYERS = min(NUM_CPUS, 4)
+    # Set device for this process
+    torch.cuda.set_device(rank)
+    device = torch.device(f'cuda:{rank}')
 
     # Initialize neural network
     neural_net = HexNet(BOARD_SIZE, num_res_blocks=NUM_RES_BLOCKS, num_filters=NUM_FILTERS).to(device)
 
+    # Wrap model with DDP
+    ddp_model = DDP(neural_net, device_ids=[rank], output_device=rank)
+
     # Optimizer and Scheduler
-    optimizer = optim.SGD(neural_net.parameters(), lr=LEARNING_RATE, momentum=MOMENTUM, nesterov=True)
+    optimizer = optim.SGD(ddp_model.parameters(), lr=LEARNING_RATE, momentum=MOMENTUM, nesterov=True)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_MAX)
 
     # Load the latest model and optimizer states if available
@@ -697,18 +700,21 @@ def train_agent():
     if latest_model_path and os.path.exists(latest_model_path):
         checkpoint = torch.load(latest_model_path, map_location=device)
         if 'model_state_dict' in checkpoint:
-            neural_net.load_state_dict(checkpoint['model_state_dict'])
+            ddp_model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             start_episode = checkpoint['episode'] + 1
-            logging.info(f"Resuming training from episode {start_episode}")
+            if rank == 0:
+                logging.info(f"Resuming training from episode {start_episode}")
         else:
             start_episode = 1
-            logging.info("Starting training from scratch")
+            if rank == 0:
+                logging.info("Starting training from scratch")
     else:
         start_episode = 1
-        logging.info("Starting training from scratch")
+        if rank == 0:
+            logging.info("Starting training from scratch")
 
-    # Replay memory
+    # Replay memory (shared across processes)
     memory = deque(maxlen=MEMORY_SIZE)
 
     # Initialize variables for logging
@@ -718,20 +724,19 @@ def train_agent():
     episodes_since_last_log = 0
     start_time = time.time()
 
-    # Set up multiprocessing
-    mp.set_start_method('spawn', force=True)  # Use 'spawn' to avoid issues with CUDA tensors
+    # Set up multiprocessing for self-play
+    manager = mp.Manager()
+    return_data_queue = manager.Queue()
 
     for episode in range(start_episode, NUM_EPISODES + 1):
-        # Generate self-play games in parallel
-        manager = mp.Manager()
-        return_data_queue = manager.Queue()
+        # Generate self-play games in parallel using CPUs
         processes = []
 
         # Move the model state_dict to CPU before passing
-        state_dict_cpu = {k: v.cpu() for k, v in neural_net.state_dict().items()}
+        state_dict_cpu = {k: v.cpu() for k, v in ddp_model.state_dict().items()}
 
         for _ in range(NUM_SELF_PLAYERS):
-            p = mp.Process(target=play_game, args=(state_dict_cpu, device.type, return_data_queue))
+            p = mp.Process(target=play_game, args=(state_dict_cpu, 'cpu', return_data_queue))
             p.start()
             processes.append(p)
 
@@ -759,7 +764,8 @@ def train_agent():
                 target_vs[idx] = reward
 
             # Forward pass
-            out_pis, out_vs = neural_net(states)
+            ddp_model.train()
+            out_pis, out_vs = ddp_model(states)
 
             # Compute loss
             loss_pis = -torch.mean(torch.sum(target_pis * out_pis, dim=1))
@@ -769,7 +775,7 @@ def train_agent():
             # Backward pass and optimization
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(neural_net.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()
 
@@ -780,7 +786,7 @@ def train_agent():
             episodes_since_last_log += 1
 
         # Periodic logging
-        if episode % 10 == 0:
+        if episode % 10 == 0 and rank == 0:
             avg_policy_loss = total_policy_loss / episodes_since_last_log if episodes_since_last_log else 0
             avg_value_loss = total_value_loss / episodes_since_last_log if episodes_since_last_log else 0
             avg_total_loss = total_loss / episodes_since_last_log if episodes_since_last_log else 0
@@ -802,45 +808,45 @@ def train_agent():
             start_time = time.time()
 
         # Periodic evaluation
-        if episode % 50 == 0:
+        if episode % 50 == 0 and rank == 0:
             eval_net = HexNet(BOARD_SIZE, num_res_blocks=NUM_RES_BLOCKS, num_filters=NUM_FILTERS).to(device)
-            eval_net.load_state_dict(neural_net.state_dict())
+            eval_net.load_state_dict(ddp_model.state_dict())
             win_rate = evaluate_model(eval_net, device=device)
             logging.info(f"Episode: {episode}, Win Rate against Random: {win_rate:.2f}")
 
         # Periodic saving
-        if episode % 100 == 0:
+        if episode % 100 == 0 and rank == 0:
             model_path = f"hex_net_episode_{episode}.pth"
             torch.save({
                 'episode': episode,
-                'model_state_dict': neural_net.state_dict(),
+                'model_state_dict': ddp_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
             }, model_path)
 
             logging.info(f"Episode {episode}/{NUM_EPISODES} completed. Model saved to {model_path}.")
 
     # Save the final model
-    torch.save({
-        'episode': NUM_EPISODES,
-        'model_state_dict': neural_net.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-    }, "hex_net_final.pth")
-    logging.info("Training completed. Final model saved.")
+    if rank == 0:
+        torch.save({
+            'episode': NUM_EPISODES,
+            'model_state_dict': ddp_model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+        }, "hex_net_final.pth")
+        logging.info("Training completed. Final model saved.")
+
+    dist.destroy_process_group()
 
 # =========================
 # Main Execution
 # =========================
 
 if __name__ == "__main__":
-    # Ensure that the device selection and logging happen only in the main process
-    if torch.backends.mps.is_available():
-        print("Using MPS device")
-    elif torch.cuda.is_available():
-        NUM_GPUS = torch.cuda.device_count()
-        print(f"Using CUDA device with {NUM_GPUS} GPUs")
-    else:
-        print("Using CPU device")
+    # Parse local_rank from environment variable
+    import argparse
 
-    # Adjust NUM_SELF_PLAYERS
-    NUM_CPUS = os.cpu_count()
-    train_agent()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--local_rank', type=int, default=0)
+    args = parser.parse_args()
+
+    world_size = torch.cuda.device_count()
+    train(args.local_rank, world_size)
