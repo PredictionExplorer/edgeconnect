@@ -1,3 +1,4 @@
+# Import necessary modules
 from collections import deque, defaultdict
 from copy import deepcopy
 import glob
@@ -14,6 +15,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import warnings
+import torch.multiprocessing as mp
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 # =========================
 # Configuration and Constants
@@ -30,17 +34,6 @@ logging.basicConfig(
 # Suppress FutureWarnings from torch.load
 warnings.simplefilter('ignore', category=FutureWarning)
 
-# Set the device for PyTorch
-if torch.backends.mps.is_available():
-    device = torch.device('mps')
-    print("Using MPS device")
-elif torch.cuda.is_available():
-    device = torch.device('cuda')
-    print("Using CUDA device")
-else:
-    device = torch.device('cpu')
-    print("Using CPU device")
-
 # Game Constants
 BOARD_SIZE = 5  # Radius of the hexagonal board
 NUM_PLAYERS = 2
@@ -50,7 +43,7 @@ PLAYER2 = 2
 
 # Training Parameters
 LEARNING_RATE = 1e-2
-BATCH_SIZE = 256
+BATCH_SIZE = 2048  # Increased batch size
 MEMORY_SIZE = 100000  # Increased for more training data
 NUM_EPISODES = 1000
 MCTS_SIMULATIONS = 800  # Similar to AlphaZero's approach
@@ -61,6 +54,9 @@ MOMENTUM = 0.9
 
 # Learning Rate Scheduler Parameters
 T_MAX = NUM_EPISODES
+
+# Automatically adjust the number of self-play processes
+NUM_CPUS = os.cpu_count()
 
 # =========================
 # Helper Functions
@@ -118,7 +114,7 @@ def augment_data(state, pi, board_size=BOARD_SIZE):
                 pi_full[i, j] = pi[index]
                 index += 1
 
-    for k in range(4):
+    for k in range(6):
         # Rotate state and pi
         rotated_state = np.rot90(state_np, k, axes=(1, 2))
         rotated_pi_full = np.rot90(pi_full, k)
@@ -275,15 +271,13 @@ class HexGame:
 
         size = self.board.shape[0]
         hex_radius = 1  # Adjust the size of the hexagons
-        hex_height = np.sqrt(3) * hex_radius  # Height of a hexagon
-        hex_width = 2 * hex_radius  # Width of a hexagon
 
         for i in range(size):
             for j in range(size):
                 if self.board[i, j] != -1:
-                    # Calculate the offset positions for a hexagonal grid
-                    x_offset = (j - (self.board_size - 1)) * (hex_width * 0.75)
-                    y_offset = -(i - (self.board_size - 1)) * (hex_height) + (j - (self.board_size - 1)) * (hex_height / 2)
+                    # Calculate the positions for a hexagonal grid
+                    x_offset = (i - (self.board_size - 1)) * 1.5 * hex_radius
+                    y_offset = (j - (self.board_size - 1)) * np.sqrt(3) * hex_radius + (i - (self.board_size - 1)) * np.sqrt(3)/2 * hex_radius
 
                     hex_patch = patches.RegularPolygon(
                         (x_offset, y_offset),
@@ -348,8 +342,6 @@ class HexNet(nn.Module):
             num_res_blocks (int): Number of residual blocks.
             num_filters (int): Number of convolutional filters.
         """
-
-    def __init__(self, board_size, num_res_blocks=NUM_RES_BLOCKS, num_filters=NUM_FILTERS):
         super(HexNet, self).__init__()
         self.board_size = board_size
         self.input_channels = 2
@@ -371,7 +363,6 @@ class HexNet(nn.Module):
         self.value_head = ValueHead(num_filters, board_size)
 
     def forward(self, x):
-        x = x.to(device)
         x = F.silu(self.bn1(self.conv1(x)))  # Using SiLU activation function
         for res_block in self.res_blocks:
             x = res_block(x)
@@ -454,10 +445,11 @@ class MCTSNode:
         self.prior = 0  # Prior probability from policy network
 
 class MCTS:
-    def __init__(self, neural_net, num_simulations=MCTS_SIMULATIONS, cpuct=CPUCT):
+    def __init__(self, neural_net, num_simulations=MCTS_SIMULATIONS, cpuct=CPUCT, device='cpu'):
         self.neural_net = neural_net
         self.num_simulations = num_simulations
         self.cpuct = cpuct
+        self.device = device
 
     def evaluate(self, game_states):
         """
@@ -470,7 +462,7 @@ class MCTS:
         for game in game_states:
             state_tensor = state_to_tensor(game.get_state(), game.current_player)
             state_tensors.append(state_tensor)
-        state_tensors = torch.cat(state_tensors).to(device)
+        state_tensors = torch.cat(state_tensors).to(self.device)
         with torch.no_grad():
             policies, values = self.neural_net(state_tensors)
             policies = policies.exp().cpu().numpy()
@@ -483,10 +475,6 @@ class MCTS:
         """
         root = MCTSNode(game.copy())
 
-        # Collect leaf nodes for batch evaluation
-        game_states = []
-        nodes = []
-
         for _ in range(self.num_simulations):
             node = root
             state = game.copy()
@@ -496,15 +484,12 @@ class MCTS:
                 move, node = self.select_child(node)
                 state.make_move(*move)
 
-            nodes.append(node)
-            game_states.append(state)
-
-        # Batch evaluation
-        policies, values = self.evaluate(game_states)
-
-        for node, policy, value in zip(nodes, policies, values):
-            state = node.game_state
+            # Expansion and Evaluation
             if not state.is_game_over():
+                policy, value = self.evaluate([state])
+                policy = policy[0]
+                value = value[0]
+
                 valid_moves = state.get_valid_moves()
                 policy_probs = {}
                 for move in valid_moves:
@@ -536,7 +521,7 @@ class MCTS:
                     value = -1
 
             # Backpropagation
-            self.backpropagate(node, value)
+            self.backpropagate(node, -value)  # Note: value is from the perspective of the next player
 
         # Aggregate visit counts
         visit_counts = defaultdict(int)
@@ -610,14 +595,14 @@ def get_latest_model_path():
     else:
         return None
 
-def evaluate_model(neural_net, num_games=10):
+def evaluate_model(neural_net, num_games=10, device='cpu'):
     """
     Evaluate the current model by playing games against a random opponent.
     """
     wins = 0
     for _ in range(num_games):
         game = HexGame()
-        mcts = MCTS(neural_net, num_simulations=MCTS_SIMULATIONS, cpuct=CPUCT)
+        mcts = MCTS(neural_net, num_simulations=MCTS_SIMULATIONS, cpuct=CPUCT, device=device)
         while not game.is_game_over():
             if game.current_player == PLAYER1:
                 # Use MCTS to select move
@@ -636,7 +621,71 @@ def evaluate_model(neural_net, num_games=10):
     win_rate = wins / num_games
     return win_rate
 
+def play_game(neural_net_state_dict, device, return_data_queue):
+    """
+    Play a single self-play game and return training data.
+    """
+    neural_net = HexNet(BOARD_SIZE, num_res_blocks=NUM_RES_BLOCKS, num_filters=NUM_FILTERS).to(device)
+    neural_net.load_state_dict(neural_net_state_dict)
+    neural_net.eval()
+
+    game = HexGame()
+    mcts = MCTS(neural_net, num_simulations=MCTS_SIMULATIONS, cpuct=CPUCT, device=device)
+    training_examples = []
+
+    while not game.is_game_over():
+        action_probs = mcts.get_action_probs(game, temp=1)
+
+        # Choose action according to probabilities
+        moves = list(action_probs.keys())
+        probs = list(action_probs.values())
+        if any(np.isnan(probs)) or sum(probs) == 0:
+            # Assign equal probability if probs are invalid
+            probs = [1 / len(probs)] * len(probs)
+        move = random.choices(moves, weights=probs)[0]
+
+        # Record training data
+        state_tensor = state_to_tensor(game.get_state(), game.current_player)
+        pi = np.zeros(neural_net.num_actions, dtype=np.float32)
+        for move_prob, prob in action_probs.items():
+            index = move_to_index(move_prob, game.board_size)
+            pi[index] = prob
+        training_examples.append((state_tensor, pi, game.current_player))
+
+        # Make the move
+        game.make_move(*move)
+
+    winner = game.get_winner()
+    data = []
+    for state, pi, player in training_examples:
+        if winner == player:
+            reward = 1
+        elif winner == 0:
+            reward = 0
+        else:
+            reward = -1
+
+        augmented_data = augment_data(state, pi, game.board_size)
+        for aug_state, aug_pi in augmented_data:
+            data.append((aug_state.unsqueeze(0), aug_pi, reward))
+    return_data_queue.put(data)
+
 def train_agent():
+    # Set device
+    if torch.backends.mps.is_available():
+        device = torch.device('mps')
+        print("Using MPS device")
+    elif torch.cuda.is_available():
+        device = torch.device('cuda')
+        NUM_GPUS = torch.cuda.device_count()
+        print(f"Using CUDA device with {NUM_GPUS} GPUs")
+    else:
+        device = torch.device('cpu')
+        print("Using CPU device")
+
+    # Adjust NUM_SELF_PLAYERS
+    NUM_SELF_PLAYERS = min(NUM_CPUS, 4)
+
     # Initialize neural network
     neural_net = HexNet(BOARD_SIZE, num_res_blocks=NUM_RES_BLOCKS, num_filters=NUM_FILTERS).to(device)
 
@@ -663,9 +712,6 @@ def train_agent():
     # Replay memory
     memory = deque(maxlen=MEMORY_SIZE)
 
-    # MCTS instance
-    mcts = MCTS(neural_net, num_simulations=MCTS_SIMULATIONS, cpuct=CPUCT)
-
     # Initialize variables for logging
     total_policy_loss = 0
     total_value_loss = 0
@@ -673,50 +719,28 @@ def train_agent():
     episodes_since_last_log = 0
     start_time = time.time()
 
+    # Set up multiprocessing
+    mp.set_start_method('spawn', force=True)  # Use 'spawn' to avoid issues with CUDA tensors
+
     for episode in range(start_episode, NUM_EPISODES + 1):
-        game = HexGame()
-        training_examples = []
+        # Generate self-play games in parallel
+        manager = mp.Manager()
+        return_data_queue = manager.Queue()
+        processes = []
 
-        while not game.is_game_over():
-            # Adjust MCTS simulations dynamically
-            total_moves = len(game.get_valid_moves())
-            simulations = int(MCTS_SIMULATIONS * (total_moves / ((2 * BOARD_SIZE - 1) ** 2)))
-            mcts.num_simulations = max(simulations, 100)
+        for _ in range(NUM_SELF_PLAYERS):
+            p = mp.Process(target=play_game, args=(neural_net.state_dict(), device, return_data_queue))
+            p.start()
+            processes.append(p)
 
-            # Get action probabilities from MCTS
-            action_probs = mcts.get_action_probs(game, temp=1)
+        # Collect training data
+        for _ in range(NUM_SELF_PLAYERS):
+            data = return_data_queue.get()
+            memory.extend(data)
 
-            # Choose action according to probabilities
-            moves = list(action_probs.keys())
-            probs = list(action_probs.values())
-            if any(np.isnan(probs)) or sum(probs) == 0:
-                # Assign equal probability if probs are invalid
-                probs = [1 / len(probs)] * len(probs)
-            move = random.choices(moves, weights=probs)[0]
-
-            # Record training data
-            state_tensor = state_to_tensor(game.get_state(), game.current_player)
-            pi = np.zeros(neural_net.num_actions, dtype=np.float32)
-            for move, prob in action_probs.items():
-                index = move_to_index(move, game.board_size)
-                pi[index] = prob
-            training_examples.append((state_tensor, pi, game.current_player))
-
-            # Make the move
-            game.make_move(*move)
-
-        winner = game.get_winner()
-        for state, pi, player in training_examples:
-            if winner == player:
-                reward = 1
-            elif winner == 0:
-                reward = 0
-            else:
-                reward = -1
-
-            augmented_data = augment_data(state, pi, game.board_size)
-            for aug_state, aug_pi in augmented_data:
-                memory.append((aug_state.unsqueeze(0), aug_pi, reward))
+        # Ensure all processes have finished
+        for p in processes:
+            p.join()
 
         # Training step
         if len(memory) >= BATCH_SIZE:
@@ -777,7 +801,9 @@ def train_agent():
 
         # Periodic evaluation
         if episode % 50 == 0:
-            win_rate = evaluate_model(neural_net)
+            eval_net = HexNet(BOARD_SIZE, num_res_blocks=NUM_RES_BLOCKS, num_filters=NUM_FILTERS).to(device)
+            eval_net.load_state_dict(neural_net.state_dict())
+            win_rate = evaluate_model(eval_net, device=device)
             logging.info(f"Episode: {episode}, Win Rate against Random: {win_rate:.2f}")
 
         # Periodic saving
@@ -788,13 +814,6 @@ def train_agent():
                 'model_state_dict': neural_net.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
             }, model_path)
-
-            # Save move history and board visualization
-            moves_filename = f"game_episode_{episode}_moves.txt"
-            game.save_move_history(moves_filename)
-
-            image_filename = f"game_episode_{episode}_board.png"
-            game.render(save_path=image_filename)
 
             logging.info(f"Episode {episode}/{NUM_EPISODES} completed. Model saved to {model_path}.")
 
@@ -811,6 +830,21 @@ def train_agent():
 # =========================
 
 if __name__ == "__main__":
-    # Start training
-    train_agent()
+    # Ensure that the device selection and logging happen only in the main process
+    if torch.backends.mps.is_available():
+        print("Using MPS device")
+    elif torch.cuda.is_available():
+        NUM_GPUS = torch.cuda.device_count()
+        print(f"Using CUDA device with {NUM_GPUS} GPUs")
+    else:
+        print("Using CPU device")
 
+    # Adjust NUM_SELF_PLAYERS
+    NUM_CPUS = os.cpu_count()
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        # Use DDP
+        world_size = torch.cuda.device_count()
+        mp.spawn(train_agent, nprocs=world_size)
+    else:
+        # Single-process training
+        train_agent()
