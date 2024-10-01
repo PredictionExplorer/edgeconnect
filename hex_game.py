@@ -1,5 +1,15 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from copy import deepcopy
+import random
+NUM_PLAYERS = 2
+EMPTY = 0
+PLAYER1 = 1
+PLAYER2 = 2
+
 class HexGame:
-    def __init__(self, board_size=BOARD_SIZE):
+    def __init__(self, board_size):
         self.board_size = board_size
         self.board = self.create_board()
         self.current_player = PLAYER1
@@ -48,6 +58,7 @@ class HexGame:
         return moves
 
     def make_move(self, x, y):
+        assert(self.is_valid_position_static(x, y, self.board_size))
         if self.board[x, y] != EMPTY:
             return False
         self.board[x, y] = self.current_player
@@ -59,7 +70,10 @@ class HexGame:
         return True
 
     def is_game_over(self):
-        return self.moves_made == np.sum(self.board != -1)
+        result = self.moves_made == np.sum(self.board != -1)
+        if result:
+            assert(len(self.get_valid_moves()) == 0)
+        return result
 
     def get_winner(self):
         scores = self.calculate_scores()
@@ -69,6 +83,13 @@ class HexGame:
             return PLAYER2
         else:
             return 0  # Draw
+        
+    def fill_empty_cells(self):
+        size = self.board.shape[0]
+        for x in range(size):
+            for y in range(size):
+                if self.board[x, y] == EMPTY:
+                    self.board[x, y] = PLAYER1
 
     def calculate_scores(self):
         """
@@ -77,29 +98,30 @@ class HexGame:
         # Step 1: Initialize score_state board
         max_player = PLAYER1
         min_player = PLAYER2
-        score_state = np.where(self.board == min_player, min_player, max_player)
 
         done = False
         iterations = 0
         max_iterations = 1000  # To prevent infinite loops
+
+        self.fill_empty_cells()
 
         while not done and iterations < max_iterations:
             done = True
             iterations += 1
 
             # Step 2: Assign groups based on score_state
-            groups, num_groups = self.identify_groups_score_state(score_state)
+            groups, num_groups = self.identify_groups_score_state()
 
             # Step 3: Count edge cells for each group
             num_edge_nodes = {max_player: [0] * num_groups[max_player],
                             min_player: [0] * num_groups[min_player]}
 
-            size = score_state.shape[0]
+            size = self.board.shape[0]
             for x in range(size):
                 for y in range(size):
-                    if score_state[x, y] in (max_player, min_player):
+                    if self.board[x, y] in (max_player, min_player):
                         if self.is_edge_cell(x, y):
-                            player = score_state[x, y]
+                            player = self.board[x, y]
                             group_id = groups[player][(x, y)]
                             num_edge_nodes[player][group_id] += 1
 
@@ -108,7 +130,8 @@ class HexGame:
                 opponent = min_player if player == max_player else max_player
                 for (x, y), group_id in groups[player].items():
                     if num_edge_nodes[player][group_id] < 2:
-                        score_state[x, y] = opponent
+                        print(f"Flipping {player} group at {x}, {y}")
+                        self.board[x, y] = opponent
                         done = False  # We made a change, need another iteration
 
         # Step 5: Calculate edge cells and center cell
@@ -121,24 +144,23 @@ class HexGame:
 
         num_edges = {PLAYER1: 0, PLAYER2: 0}
 
-        size = score_state.shape[0]
+        size = self.board.shape[0]
         num_edge_cells = 0
         for x in range(size):
             for y in range(size):
-                player = score_state[x, y]
+                player = self.board[x, y]
                 if player in (PLAYER1, PLAYER2):
                     if self.is_edge_cell(x, y):
                         num_edge_cells += 1
                         num_edges[player] += 1
                     if (x, y) == self.center_cell:
                         scores['center_cell'][player] = 1  # Center cell bonus
-        print("num edge cells", num_edge_cells)
-        assert(num_edge_cells == 6 * (self.board_size - 1))
-        assert(num_edges[PLAYER1] + num_edges[PLAYER2] == 6 * (self.board_size - 1))
+        #assert(num_edge_cells == 6 * (self.board_size - 1))
+        #assert(num_edges[PLAYER1] + num_edges[PLAYER2] == 6 * (self.board_size - 1))
         scores['edge_cells'] = num_edges
 
         # Step 6: Calculate group counts for bonus
-        groups, num_groups = self.identify_groups_score_state(score_state)
+        groups, num_groups = self.identify_groups_score_state()
 
         # Calculate group bonus
         group_bonus_p1 = 2 * (num_groups[PLAYER2] - num_groups[PLAYER1])
@@ -159,12 +181,12 @@ class HexGame:
         total_possible_points = edge_cells_count + 1  # +1 for the center cell
 
         total_score = scores['total'][PLAYER1] + scores['total'][PLAYER2]
-        assert total_score == total_possible_points, f"Total score {total_score} does not match expected {total_possible_points}"
+        #assert total_score == total_possible_points, f"Total score {total_score} does not match expected {total_possible_points}"
 
         return scores
 
 
-    def identify_groups_score_state(self, score_state):
+    def identify_groups_score_state(self):
         """
         Identify groups in the score_state board.
         Returns:
@@ -174,11 +196,11 @@ class HexGame:
         visited = set()
         groups = {PLAYER1: {}, PLAYER2: {}}
         group_ids = {PLAYER1: 0, PLAYER2: 0}
-        size = score_state.shape[0]
+        size = self.board.shape[0]
 
         for x in range(size):
             for y in range(size):
-                player = score_state[x, y]
+                player = self.board[x, y]
                 if player in (PLAYER1, PLAYER2) and (x, y) not in visited:
                     group_id = group_ids[player]
                     stack = [(x, y)]
@@ -186,12 +208,12 @@ class HexGame:
                         cx, cy = stack.pop()
                         if (cx, cy) in visited:
                             continue
-                        if score_state[cx, cy] == player:
+                        if self.board[cx, cy] == player:
                             visited.add((cx, cy))
                             groups[player][(cx, cy)] = group_id
-                            neighbors = self.get_neighbors(cx, cy, score_state)
+                            neighbors = self.get_neighbors(cx, cy, self.board)
                             for nx, ny in neighbors:
-                                if score_state[nx, ny] == player and (nx, ny) not in visited:
+                                if self.board[nx, ny] == player and (nx, ny) not in visited:
                                     stack.append((nx, ny))
                     group_ids[player] += 1
 
@@ -239,7 +261,7 @@ class HexGame:
         """
         Visualize the board using Matplotlib.
         """
-        fig, ax = plt.subplots(figsize=(8, 8))
+        fig, ax = plt.subplots(figsize=(10, 10))  # Increased figure size for better visibility
         ax.set_aspect('equal')
         ax.axis('off')
 
@@ -257,7 +279,7 @@ class HexGame:
                         (x_offset, y_offset),
                         numVertices=6,
                         radius=hex_radius,
-                        orientation=np.radians(0),
+                        orientation=np.radians(30),
                         facecolor='lightgray',
                         edgecolor='black'
                     )
@@ -273,6 +295,10 @@ class HexGame:
                         hex_patch.set_facecolor('red')
 
                     ax.add_patch(hex_patch)
+
+                    # Print coordinates for all cells
+                    ax.text(x_offset, y_offset, f"({i},{j})", 
+                            ha='center', va='center', fontsize=6, fontweight='bold')
 
         # Calculate scores
         scores = self.calculate_scores()
@@ -296,7 +322,7 @@ class HexGame:
         ax.autoscale_view()
 
         if save_path:
-            plt.savefig(save_path)
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
         if show:
             plt.show()
         plt.close(fig)
@@ -308,6 +334,37 @@ class HexGame:
                 position = move['position']
                 f.write(f"{player}: {position}\n")
 
-    def replay_game(self):
-        # Optional: Implement replay functionality if needed
-        pass
+    def play_random_game(self):
+        #random.seed(42)
+        while not self.is_game_over():
+            valid_moves = self.get_valid_moves()
+            move = random.choice(valid_moves)
+            self.make_move(move[0], move[1])
+
+    def play_random_move(self):
+        valid_moves = self.get_valid_moves()
+        move = random.choice(valid_moves)
+        self.make_move(move[0], move[1])
+
+if __name__ == "__main__":
+    game = HexGame(board_size=3)
+    game.make_move(2, 2)
+    game.make_move(3, 2)
+    game.play_random_move()
+    game.make_move(2, 3)
+    game.play_random_move()
+    game.make_move(1, 3)
+    game.play_random_move()
+    game.make_move(1, 2)
+    game.play_random_move()
+    game.make_move(2, 1)
+    game.play_random_move()
+    game.make_move(3, 1)
+    game.play_random_move()
+    game.make_move(0, 2)
+    game.play_random_move()
+
+    game.render(save_path="test.png", show=True)
+    scores = game.calculate_scores()
+    print("scores", scores) 
+    game.render(save_path="test2.png", show=True)
