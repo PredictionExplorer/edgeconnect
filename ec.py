@@ -12,9 +12,12 @@ from copy import deepcopy
 import numpy as np
 import random
 import time
+import math
 import logging
 import glob
-import math
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import warnings
 
 # =========================
 # Configuration and Constants
@@ -28,6 +31,10 @@ logging.basicConfig(
     level=logging.INFO
 )
 
+# Suppress warnings
+warnings.simplefilter('ignore', category=UserWarning)
+warnings.simplefilter('ignore', category=FutureWarning)
+
 # Game Constants
 BOARD_SIZE = 5  # Radius of the hexagonal board
 NUM_PLAYERS = 2
@@ -37,13 +44,13 @@ PLAYER2 = 2
 
 # Training Parameters
 LEARNING_RATE = 1e-2
-BATCH_SIZE = 2048  # Adjust based on memory
+BATCH_SIZE = 16384  # Increased batch size
 MEMORY_SIZE = 100000
 NUM_EPISODES = 1000
-MCTS_SIMULATIONS = 800
+MCTS_SIMULATIONS = 800  # You can increase this number to make MCTS more intensive
 CPUCT = 1.0  # Exploration constant
-NUM_RES_BLOCKS = 5
-NUM_FILTERS = 64
+NUM_RES_BLOCKS = 10  # Increased number of residual blocks
+NUM_FILTERS = 128  # Increased number of filters
 MOMENTUM = 0.9
 
 # Learning Rate Scheduler Parameters
@@ -51,7 +58,10 @@ T_MAX = NUM_EPISODES
 
 # Adjust the number of self-play processes
 NUM_CPUS = os.cpu_count()
-NUM_SELF_PLAYERS = min(NUM_CPUS, 4)  # Adjust based on CPU availability
+NUM_SELF_PLAYERS = min(NUM_CPUS, 32)  # Adjust based on CPU availability
+
+# Adjust saving frequency
+SAVE_INTERVAL = 10  # Save model every 10 episodes
 
 # =========================
 # Helper Functions
@@ -623,6 +633,8 @@ def play_game(neural_net_state_dict, device, return_data_queue):
     """
     # Ensure device is set correctly
     device = torch.device(device)
+    if device.type == 'cuda':
+        torch.cuda.set_device(device)
 
     # Initialize neural network and load state dict
     neural_net = HexNet(BOARD_SIZE, num_res_blocks=NUM_RES_BLOCKS, num_filters=NUM_FILTERS)
@@ -675,6 +687,11 @@ def play_game(neural_net_state_dict, device, return_data_queue):
         augmented_data = augment_data(state, pi, game.board_size)
         for aug_state, aug_pi in augmented_data:
             data.append((aug_state.unsqueeze(0), aug_pi, reward))
+
+    # Save the final game board
+    game_id = random.randint(0, 1e6)
+    game.render(save_path=f"game_{game_id}.png")
+
     return_data_queue.put(data)
 
 def train():
@@ -694,8 +711,9 @@ def train():
 
         # Set device for this process
         if torch.cuda.is_available():
-            torch.cuda.set_device(rank % torch.cuda.device_count())
-            device = torch.device(f'cuda:{rank % torch.cuda.device_count()}')
+            device_index = rank % torch.cuda.device_count()
+            torch.cuda.set_device(device_index)
+            device = torch.device(f'cuda:{device_index}')
         else:
             device = torch.device('cpu')  # For CPUs or MPS devices
     else:
@@ -712,12 +730,23 @@ def train():
             device = torch.device('cpu')
             print("Using CPU device")
 
+    # Prepare device string to pass to child processes
+    if device.type == 'cuda':
+        device_index = device.index
+        device_str = f'cuda:{device_index}'
+    else:
+        device_str = device.type
+
     # Initialize neural network
     neural_net = HexNet(BOARD_SIZE, num_res_blocks=NUM_RES_BLOCKS, num_filters=NUM_FILTERS).to(device)
 
     if distributed:
         # Wrap model with DDP
-        ddp_model = DDP(neural_net, device_ids=[device.index] if device.type == 'cuda' else None, output_device=device.index if device.type == 'cuda' else None)
+        ddp_model = DDP(
+            neural_net,
+            device_ids=[device.index] if device.type == 'cuda' else None,
+            output_device=device.index if device.type == 'cuda' else None
+        )
     else:
         ddp_model = neural_net
 
@@ -760,14 +789,14 @@ def train():
     return_data_queue = manager.Queue()
 
     for episode in range(start_episode, NUM_EPISODES + 1):
-        # Generate self-play games in parallel using CPUs
+        # Generate self-play games in parallel
         processes = []
 
         # Move the model state_dict to CPU before passing
         state_dict_cpu = {k: v.cpu() for k, v in ddp_model.state_dict().items()}
 
         for _ in range(NUM_SELF_PLAYERS):
-            p = mp.Process(target=play_game, args=(state_dict_cpu, 'cpu', return_data_queue))
+            p = mp.Process(target=play_game, args=(state_dict_cpu, device_str, return_data_queue))
             p.start()
             processes.append(p)
 
@@ -817,7 +846,7 @@ def train():
             episodes_since_last_log += 1
 
         # Periodic logging
-        if episode % 10 == 0 and rank == 0:
+        if episode % SAVE_INTERVAL == 0 and rank == 0:
             avg_policy_loss = total_policy_loss / episodes_since_last_log if episodes_since_last_log else 0
             avg_value_loss = total_value_loss / episodes_since_last_log if episodes_since_last_log else 0
             avg_total_loss = total_loss / episodes_since_last_log if episodes_since_last_log else 0
@@ -838,15 +867,7 @@ def train():
             episodes_since_last_log = 0
             start_time = time.time()
 
-        # Periodic evaluation
-        if episode % 50 == 0 and rank == 0:
-            eval_net = HexNet(BOARD_SIZE, num_res_blocks=NUM_RES_BLOCKS, num_filters=NUM_FILTERS).to(device)
-            eval_net.load_state_dict(ddp_model.state_dict())
-            win_rate = evaluate_model(eval_net, device=device)
-            logging.info(f"Episode: {episode}, Win Rate against Random: {win_rate:.2f}")
-
-        # Periodic saving
-        if episode % 100 == 0 and rank == 0:
+            # Save the model
             model_path = f"hex_net_episode_{episode}.pth"
             torch.save({
                 'episode': episode,
@@ -855,6 +876,13 @@ def train():
             }, model_path)
 
             logging.info(f"Episode {episode}/{NUM_EPISODES} completed. Model saved to {model_path}.")
+
+        # Periodic evaluation
+        if episode % 50 == 0 and rank == 0:
+            eval_net = HexNet(BOARD_SIZE, num_res_blocks=NUM_RES_BLOCKS, num_filters=NUM_FILTERS).to(device)
+            eval_net.load_state_dict(ddp_model.state_dict())
+            win_rate = evaluate_model(eval_net, device=device)
+            logging.info(f"Episode: {episode}, Win Rate against Random: {win_rate:.2f}")
 
     # Save the final model
     if rank == 0:
