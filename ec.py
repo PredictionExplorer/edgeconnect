@@ -1,23 +1,20 @@
 # Import necessary modules
-from collections import deque, defaultdict
-from copy import deepcopy
-import glob
-import logging
-import math
-import matplotlib.patches as patches
-import matplotlib.pyplot as plt
-import numpy as np
 import os
-import random
-import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import warnings
 import torch.multiprocessing as mp
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from collections import deque, defaultdict
+from copy import deepcopy
+import numpy as np
+import random
+import time
+import logging
+import glob
+import math
 
 # =========================
 # Configuration and Constants
@@ -30,9 +27,6 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)s: %(message)s',
     level=logging.INFO
 )
-
-# Suppress FutureWarnings from torch.load
-warnings.simplefilter('ignore', category=FutureWarning)
 
 # Game Constants
 BOARD_SIZE = 5  # Radius of the hexagonal board
@@ -632,7 +626,13 @@ def play_game(neural_net_state_dict, device, return_data_queue):
 
     # Initialize neural network and load state dict
     neural_net = HexNet(BOARD_SIZE, num_res_blocks=NUM_RES_BLOCKS, num_filters=NUM_FILTERS)
-    neural_net.load_state_dict(neural_net_state_dict)
+    # Adjust the state_dict keys if necessary
+    state_dict = neural_net_state_dict
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        new_key = k.replace('module.', '')  # Remove 'module.' prefix if present
+        new_state_dict[new_key] = v
+    neural_net.load_state_dict(new_state_dict)
     neural_net.to(device)
     neural_net.eval()
 
@@ -679,7 +679,9 @@ def play_game(neural_net_state_dict, device, return_data_queue):
 
 def train():
     # Check if we're in distributed mode
-    if 'RANK' in os.environ:
+    distributed = False
+    if 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) > 1:
+        distributed = True
         rank = int(os.environ['RANK'])
         world_size = int(os.environ['WORLD_SIZE'])
 
@@ -692,8 +694,8 @@ def train():
 
         # Set device for this process
         if torch.cuda.is_available():
-            torch.cuda.set_device(rank)
-            device = torch.device(f'cuda:{rank}')
+            torch.cuda.set_device(rank % torch.cuda.device_count())
+            device = torch.device(f'cuda:{rank % torch.cuda.device_count()}')
         else:
             device = torch.device('cpu')  # For CPUs or MPS devices
     else:
@@ -713,9 +715,9 @@ def train():
     # Initialize neural network
     neural_net = HexNet(BOARD_SIZE, num_res_blocks=NUM_RES_BLOCKS, num_filters=NUM_FILTERS).to(device)
 
-    if world_size > 1:
+    if distributed:
         # Wrap model with DDP
-        ddp_model = DDP(neural_net, device_ids=[device] if device.type == 'cuda' else None, output_device=device)
+        ddp_model = DDP(neural_net, device_ids=[device.index] if device.type == 'cuda' else None, output_device=device.index if device.type == 'cuda' else None)
     else:
         ddp_model = neural_net
 
@@ -742,7 +744,7 @@ def train():
         if rank == 0:
             logging.info("Starting training from scratch")
 
-    # Replay memory (shared across processes)
+    # Replay memory (use a local deque in each process)
     memory = deque(maxlen=MEMORY_SIZE)
 
     # Initialize variables for logging
@@ -753,6 +755,7 @@ def train():
     start_time = time.time()
 
     # Set up multiprocessing for self-play
+    mp.set_start_method('spawn', force=True)
     manager = mp.Manager()
     return_data_queue = manager.Queue()
 
@@ -862,7 +865,7 @@ def train():
         }, "hex_net_final.pth")
         logging.info("Training completed. Final model saved.")
 
-    if world_size > 1:
+    if distributed:
         dist.destroy_process_group()
 
 # =========================
