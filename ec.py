@@ -18,6 +18,7 @@ import glob
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import warnings
+from hex_game import HexGame
 
 # =========================
 # Configuration and Constants
@@ -36,7 +37,7 @@ warnings.simplefilter('ignore', category=UserWarning)
 warnings.simplefilter('ignore', category=FutureWarning)
 
 # Game Constants
-BOARD_SIZE = 5  # Radius of the hexagonal board
+BOARD_SIZE = 5 # Radius of the hexagonal board
 NUM_PLAYERS = 2
 EMPTY = 0
 PLAYER1 = 1
@@ -47,7 +48,7 @@ LEARNING_RATE = 1e-2
 BATCH_SIZE = 16384  # Increased batch size
 MEMORY_SIZE = 100000
 NUM_EPISODES = 1000
-MCTS_SIMULATIONS = 800  # You can increase this number to make MCTS more intensive
+MCTS_SIMULATIONS = 10  # You can increase this number to make MCTS more intensive
 CPUCT = 1.0  # Exploration constant
 NUM_RES_BLOCKS = 10  # Increased number of residual blocks
 NUM_FILTERS = 128  # Increased number of filters
@@ -58,7 +59,7 @@ T_MAX = NUM_EPISODES
 
 # Adjust the number of self-play processes
 NUM_CPUS = os.cpu_count()
-NUM_SELF_PLAYERS = min(NUM_CPUS, 32)  # Adjust based on CPU availability
+NUM_SELF_PLAYERS = min(NUM_CPUS, 1)  # Adjust based on CPU availability
 
 # Adjust saving frequency
 SAVE_INTERVAL = 10  # Save model every 10 episodes
@@ -143,196 +144,6 @@ def augment_data(state, pi, board_size=BOARD_SIZE):
         augmented_data.append((torch.from_numpy(flipped_state.copy()), np.array(pi_aug)))
 
     return augmented_data
-
-# =========================
-# HexGame Class
-# =========================
-
-class HexGame:
-    def __init__(self, board_size=BOARD_SIZE):
-        self.board_size = board_size
-        self.board = self.create_board()
-        self.current_player = PLAYER1
-        self.moves_made = 0
-        self.move_history = []  # Record of moves
-
-        # Center cell coordinates
-        center = self.board_size - 1
-        self.center_cell = (center, center)
-
-        # Precompute edge cells (excluding center cell)
-        self.edge_cells = self.get_edge_cells()
-
-    def create_board(self):
-        size = 2 * self.board_size - 1
-        board = np.full((size, size), -1, dtype=int)
-        for i in range(size):
-            for j in range(size):
-                if self.is_valid_position_static(i, j, self.board_size):
-                    board[i, j] = EMPTY
-        return board
-
-    @staticmethod
-    def is_valid_position_static(x, y, board_size):
-        size = 2 * board_size - 1
-        return 0 <= x < size and 0 <= y < size and \
-               max(abs(x - (board_size - 1)), abs(y - (board_size - 1)), abs((x + y) - (board_size - 1) * 2)) < board_size
-
-    def get_edge_cells(self):
-        size = 2 * self.board_size - 1
-        edge_cells = []
-        for i in range(size):
-            for j in range(size):
-                if self.is_valid_position_static(i, j, self.board_size):
-                    if self.is_edge_cell(i, j):
-                        edge_cells.append((i, j))
-        # Ensure center cell is not in edge cells
-        edge_cells = [cell for cell in edge_cells if cell != self.center_cell]
-        return edge_cells
-
-    def is_edge_cell(self, x, y):
-        size = 2 * self.board_size - 1
-        return x == 0 or y == 0 or x == size - 1 or y == size - 1 or \
-               (x + y) == (self.board_size - 1) * 2 or \
-               (x + y) == 0
-
-    def get_valid_moves(self):
-        moves = []
-        indices = np.argwhere(self.board == EMPTY)
-        for idx in indices:
-            moves.append((idx[0], idx[1]))
-        return moves
-
-    def make_move(self, x, y):
-        if self.board[x, y] != EMPTY:
-            return False
-        self.board[x, y] = self.current_player
-        self.moves_made += 1
-        # Record the move
-        self.move_history.append({'player': self.current_player, 'position': (x, y)})
-        # Switch player
-        self.current_player = PLAYER1 if self.current_player == PLAYER2 else PLAYER2
-        return True
-
-    def is_game_over(self):
-        return self.moves_made == np.sum(self.board != -1)
-
-    def get_winner(self):
-        scores = self.calculate_scores()
-        if scores['total'][PLAYER1] > scores['total'][PLAYER2]:
-            return PLAYER1
-        elif scores['total'][PLAYER2] > scores['total'][PLAYER1]:
-            return PLAYER2
-        else:
-            return 0  # Draw
-
-    def calculate_scores(self):
-        """
-        Implement the scoring logic as per your game rules.
-        For simplicity, let's assume the player with more stones on the board wins.
-        """
-        player1_score = np.sum(self.board == PLAYER1)
-        player2_score = np.sum(self.board == PLAYER2)
-        scores = {
-            'total': {
-                PLAYER1: player1_score,
-                PLAYER2: player2_score
-            }
-        }
-        return scores
-
-    def get_neighbors(self, x, y):
-        # Hexagonal grid neighbors
-        deltas = [(-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0)]
-        neighbors = []
-        for dx, dy in deltas:
-            nx, ny = x + dx, y + dy
-            if 0 <= nx < self.board.shape[0] and 0 <= ny < self.board.shape[1]:
-                if self.board[nx, ny] != -1:
-                    neighbors.append((nx, ny))
-        return neighbors
-
-    def copy(self):
-        return deepcopy(self)
-
-    def reset(self):
-        self.board = self.create_board()
-        self.current_player = PLAYER1
-        self.moves_made = 0
-        self.move_history = []
-
-    def get_state(self):
-        state = np.copy(self.board)
-        state[state == -1] = EMPTY
-        return state
-
-    def render(self, save_path=None, show=False):
-        """
-        Visualize the board using Matplotlib.
-        """
-        fig, ax = plt.subplots(figsize=(8, 8))
-        ax.set_aspect('equal')
-        ax.axis('off')
-
-        size = self.board.shape[0]
-        hex_radius = 1  # Adjust the size of the hexagons
-
-        for i in range(size):
-            for j in range(size):
-                if self.board[i, j] != -1:
-                    # Calculate the positions for a hexagonal grid
-                    x_offset = (i - (self.board_size - 1)) * 1.5 * hex_radius
-                    y_offset = (j - (self.board_size - 1)) * np.sqrt(3) * hex_radius + (i - (self.board_size - 1)) * np.sqrt(3)/2 * hex_radius
-
-                    hex_patch = patches.RegularPolygon(
-                        (x_offset, y_offset),
-                        numVertices=6,
-                        radius=hex_radius,
-                        orientation=np.radians(0),
-                        facecolor='lightgray',
-                        edgecolor='black'
-                    )
-
-                    # Highlight center cell
-                    if (i, j) == self.center_cell:
-                        hex_patch.set_facecolor('yellow')
-
-                    # Color cells based on ownership
-                    if self.board[i, j] == PLAYER1:
-                        hex_patch.set_facecolor('blue')
-                    elif self.board[i, j] == PLAYER2:
-                        hex_patch.set_facecolor('red')
-
-                    ax.add_patch(hex_patch)
-
-        # Calculate scores
-        scores = self.calculate_scores()
-        player1_score = scores['total'][PLAYER1]
-        player2_score = scores['total'][PLAYER2]
-
-        # Display scores on the plot
-        score_text = f"Player 1 (Blue): {player1_score}    Player 2 (Red): {player2_score}"
-        plt.title(score_text, fontsize=16)
-
-        ax.relim()
-        ax.autoscale_view()
-
-        if save_path:
-            plt.savefig(save_path)
-        if show:
-            plt.show()
-        plt.close(fig)
-
-    def save_move_history(self, filename):
-        with open(filename, 'w') as f:
-            for move in self.move_history:
-                player = 'Player 1' if move['player'] == PLAYER1 else 'Player 2'
-                position = move['position']
-                f.write(f"{player}: {position}\n")
-
-    def replay_game(self):
-        # Optional: Implement replay functionality if needed
-        pass
 
 # =========================
 # Neural Network Classes
@@ -628,6 +439,7 @@ def evaluate_model(neural_net, num_games=10, device='cpu'):
     return win_rate
 
 def play_game(neural_net_state_dict, device, return_data_queue):
+    print("playing game")
     """
     Play a single self-play game and return training data.
     """
@@ -689,7 +501,8 @@ def play_game(neural_net_state_dict, device, return_data_queue):
             data.append((aug_state.unsqueeze(0), aug_pi, reward))
 
     # Save the final game board
-    game_id = random.randint(0, 1e6)
+    game_id = random.randint(0, int(1e6))
+    print("saving png")
     game.render(save_path=f"game_{game_id}.png")
 
     return_data_queue.put(data)
