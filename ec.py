@@ -38,14 +38,14 @@ warnings.simplefilter('ignore', category=UserWarning)
 warnings.simplefilter('ignore', category=FutureWarning)
 
 # Game Constants
-BOARD_SIZE = 8 # Radius of the hexagonal board
+BOARD_SIZE = 5 # Radius of the hexagonal board
 
 # Training Parameters
 LEARNING_RATE = 1e-2
-BATCH_SIZE = 16384  # Increased batch size
-MEMORY_SIZE = 100000
+BATCH_SIZE = 1024  # Increased batch size
+MEMORY_SIZE = 1000
 NUM_EPISODES = 10000
-MCTS_SIMULATIONS = 800  # You can increase this number to make MCTS more intensive
+MCTS_SIMULATIONS = 50  # You can increase this number to make MCTS more intensive
 CPUCT = 1.0  # Exploration constant
 NUM_RES_BLOCKS = 10  # Increased number of residual blocks
 NUM_FILTERS = 128  # Increased number of filters
@@ -56,10 +56,10 @@ T_MAX = NUM_EPISODES
 
 # Adjust the number of self-play processes
 NUM_CPUS = os.cpu_count()
-NUM_SELF_PLAYERS = min(NUM_CPUS, 32)  # Adjust based on CPU availability
+NUM_SELF_PLAYERS = NUM_CPUS // 2  # Adjust based on CPU availability
 
 # Adjust saving frequency
-SAVE_INTERVAL = 50  # Save model every 10 episodes
+SAVE_INTERVAL = 10  # Save model every 10 episodes
 
 # =========================
 # Helper Functions
@@ -475,26 +475,19 @@ def play_game(neural_net_state_dict, device, return_data_queue):
 
 def train():
     # Check if we're in distributed mode
-    distributed = False
-    if 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) > 1:
-        distributed = True
-        rank = int(os.environ['RANK'])
-        world_size = int(os.environ['WORLD_SIZE'])
 
-        # Initialize process group with appropriate backend
-        if torch.cuda.is_available():
-            dist_backend = "nccl"
-        else:
-            dist_backend = "gloo"
-        dist.init_process_group(backend=dist_backend, rank=rank, world_size=world_size)
+    distributed = 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) > 1
+
+    if distributed:
+        # Initialize process group
+        dist.init_process_group(backend='nccl')
+        rank = dist.get_rank()
+        local_rank = int(os.environ['LOCAL_RANK'])
+        world_size = dist.get_world_size()
 
         # Set device for this process
-        if torch.cuda.is_available():
-            device_index = rank % torch.cuda.device_count()
-            torch.cuda.set_device(device_index)
-            device = torch.device(f'cuda:{device_index}')
-        else:
-            device = torch.device('cpu')  # For CPUs or MPS devices
+        device = torch.device(f'cuda:{local_rank}')
+        torch.cuda.set_device(device)
     else:
         # Single-process mode
         rank = 0
